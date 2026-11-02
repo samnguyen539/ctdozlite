@@ -4219,8 +4219,12 @@ pub async fn poll_new_messages(
         }
     }
     // 2. Poll conversation previews via `get-last-msgs` (both empty map and populated known thread IDs)
-    if let Ok(preview_resp) = get_last_msgs(s, &[]).await {
-        merge_previews(threads, &preview_resp);
+    match get_last_msgs(s, &[]).await {
+        Ok(preview_resp) => merge_previews(threads, &preview_resp),
+        Err(e) if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired => {
+            return Err(e);
+        }
+        Err(_) => {}
     }
     let known_ids: Vec<String> = threads
         .iter()

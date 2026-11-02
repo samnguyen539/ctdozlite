@@ -128,6 +128,12 @@ fn fingerprint(threads: &[Thread]) -> (usize, i64) {
 pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thread>> {
     let _guard = SYNC_LOCK.lock().await;
     let s = session.lock().await.clone();
+    if s.session_status().await == crate::session::SessionStatus::Expired {
+        let mut g = session.lock().await;
+        g.mark_expired();
+        let _ = g.save_to_file("session.json");
+        anyhow::bail!("Phiên Zalo đã hết hạn (zpw_sek không còn hiệu lực)");
+    }
     let mut list = match chat::get_friends(&s).await {
         Ok(v) => v,
         Err(e) => {
@@ -140,8 +146,15 @@ pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thre
             Vec::new()
         }
     };
-    if let Ok(groups) = chat::get_groups(&s).await {
-        list.extend(groups);
+    match chat::get_groups(&s).await {
+        Ok(groups) => list.extend(groups),
+        Err(e) if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired => {
+            let mut g = session.lock().await;
+            g.mark_expired();
+            let _ = g.save_to_file("session.json");
+            return Err(e);
+        }
+        Err(_) => {}
     }
     if let Some(li) = &s.login {
         if !li.send2me_id.is_empty() && !list.iter().any(|t| t.id == li.send2me_id) {
