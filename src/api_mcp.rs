@@ -561,6 +561,11 @@ pub async fn handle_rest_request(
             Some((url_decode(k), url_decode(v)))
         })
         .collect();
+    if let Some(r) =
+        crate::api_hub_ext::route(session, method, path, &query_params, body, db_path).await
+    {
+        return r;
+    }
 
     match (method, path) {
         ("GET", "/api/v1/status") | ("GET", "/health") => {
@@ -730,6 +735,7 @@ pub async fn run_local_http_server(
 ) -> Result<()> {
     let bind_addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
+    crate::api_hub_ext::spawn_background(session.clone());
     let expected_token = std::env::var("CTDOZLITE_API_TOKEN")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -740,14 +746,39 @@ pub async fn run_local_http_server(
         let db = db_path.clone();
         let tok = expected_token.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            let Ok(n) = stream.read(&mut buf).await else {
-                return;
-            };
-            if n == 0 {
+            let mut buf: Vec<u8> = Vec::with_capacity(8192);
+            let mut chunk = [0u8; 8192];
+            const MAX_REQ: usize = 2 * 1024 * 1024;
+            let mut header_end: Option<usize> = None;
+            let mut need_total = 0usize;
+            loop {
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let he = pos + 4;
+                        let head_txt = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                        let cl = head_txt
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        header_end = Some(he);
+                        need_total = he + cl.min(MAX_REQ);
+                    }
+                }
+                if header_end.is_some() && buf.len() >= need_total {
+                    break;
+                }
+                if buf.len() >= MAX_REQ + 65536 {
+                    break;
+                }
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            if buf.is_empty() {
                 return;
             }
-            let raw = String::from_utf8_lossy(&buf[..n]);
+            let raw = String::from_utf8_lossy(&buf);
             let (head, body_part) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
             let mut lines = head.lines();
             let req_line = lines.next().unwrap_or("");

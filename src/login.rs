@@ -267,6 +267,15 @@ pub fn apply_login_config(s: &mut Session, cfg: &Value) {
         .or_else(|| cfg.get("dkey"))
         .and_then(as_str)
         .unwrap_or_default();
+    let new_phone = cfg
+        .get("phone_number")
+        .or_else(|| cfg.get("phone"))
+        .or_else(|| {
+            cfg.get("account")
+                .and_then(|a| a.get("phone_number").or_else(|| a.get("phone")))
+        })
+        .and_then(as_str)
+        .unwrap_or_default();
 
     let new_enk = cfg.get("zpw_enk").and_then(as_str).unwrap_or_default();
     let new_send2me_id = cfg.get("send2me_id").and_then(as_str).unwrap_or_default();
@@ -303,6 +312,7 @@ pub fn apply_login_config(s: &mut Session, cfg: &Value) {
         }
     }
     if !new_name.is_empty() { current.display_name = new_name.to_string(); }
+    if !new_phone.is_empty() { current.phone = new_phone; }
     if !new_send2me_id.is_empty() { current.send2me_id = new_send2me_id.to_string(); }
 
     s.login = Some(current);

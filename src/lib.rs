@@ -32,6 +32,8 @@ pub mod media_resources;
 pub mod updater;
 /// Scheduled message queue backed by SQLite (#38, #24).
 pub mod scheduler;
+/// Hub-facing REST extensions (QR login, sync, poll, actions).
+pub mod api_hub_ext;
 /// Local HTTP REST API, MCP JSON-RPC 2.0 server, and auto-reply rules (#35).
 pub mod api_mcp;
 
