@@ -132,6 +132,9 @@ pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thre
         Ok(v) => v,
         Err(e) => {
             if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired {
+                let mut g = session.lock().await;
+                g.mark_expired();
+                let _ = g.save_to_file("session.json");
                 return Err(e);
             }
             Vec::new()
@@ -200,7 +203,14 @@ pub async fn poll_once(session: &Arc<Mutex<Session>>) -> anyhow::Result<bool> {
     let mut h = hub().lock().await;
     let before = fingerprint(&h.threads);
     let Hub { threads, poll } = &mut *h;
-    chat::poll_new_messages(&s, poll, threads).await?;
+    if let Err(e) = chat::poll_new_messages(&s, poll, threads).await {
+        if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired {
+            let mut g = session.lock().await;
+            g.mark_expired();
+            let _ = g.save_to_file("session.json");
+        }
+        return Err(e);
+    }
     Ok(before != fingerprint(&h.threads))
 }
 
@@ -530,6 +540,7 @@ pub async fn route(
         }
         ("POST", "/api/v1/sync") => match full_sync(session).await {
             Ok(t) => (200, json!({ "ok": true, "thread_count": t.len(), "threads": t.iter().map(|x| thread_json(x, 0)).collect::<Vec<_>>() })),
+            Err(e) if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired => err(401, e),
             Err(e) => err(502, e),
         },
         ("POST", "/api/v1/poll") => match poll_once(session).await {
@@ -537,6 +548,7 @@ pub async fn route(
                 let h = hub().lock().await;
                 (200, json!({ "ok": true, "changed": changed, "threads": h.threads.iter().map(|x| thread_json(x, 20)).collect::<Vec<_>>() }))
             }
+            Err(e) if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired => err(401, e),
             Err(e) => err(502, e),
         },
         ("GET", "/api/v1/threads") => {
