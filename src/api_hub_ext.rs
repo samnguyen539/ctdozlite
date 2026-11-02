@@ -128,7 +128,15 @@ fn fingerprint(threads: &[Thread]) -> (usize, i64) {
 pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thread>> {
     let _guard = SYNC_LOCK.lock().await;
     let s = session.lock().await.clone();
-    let mut list = chat::get_friends(&s).await.unwrap_or_default();
+    let mut list = match chat::get_friends(&s).await {
+        Ok(v) => v,
+        Err(e) => {
+            if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired {
+                return Err(e);
+            }
+            Vec::new()
+        }
+    };
     if let Ok(groups) = chat::get_groups(&s).await {
         list.extend(groups);
     }
