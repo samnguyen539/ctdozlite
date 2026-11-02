@@ -376,6 +376,10 @@ pub struct Session {
     /// persists in `session.json` so the next start asks for a login instead of
     /// re-testing a dead session.
     pub expired_at: Option<i64>,
+    /// Shared live `zpw_sek` updated whenever a response sets a new session cookie.
+    pub live_sek: Arc<std::sync::RwLock<Option<String>>>,
+    /// Shared live cookie map preserved across requests on `.zalo.me` and `.zaloapp.com`.
+    pub live_cookies: Arc<std::sync::RwLock<std::collections::BTreeMap<String, String>>>,
 }
 
 /// `error_code` values Zalo answers when the stored credentials are no longer usable.
@@ -504,6 +508,8 @@ impl Session {
             dump,
             dump_raw,
             expired_at: None,
+            live_sek: Arc::new(std::sync::RwLock::new(None)),
+            live_cookies: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
         })
     }
 
@@ -539,9 +545,90 @@ impl Session {
                 self.jar.add_cookie_str(&cookie, &url);
             }
         }
+        if let Ok(mut g) = self.live_sek.write() {
+            *g = Some(v.clone());
+        }
+        if let Ok(mut m) = self.live_cookies.write() {
+            m.insert("zpw_sek".into(), v.clone());
+        }
         self.zpw_sek = Some(v.clone());
-        if let Some(ref mut li) = self.login {
+        if let Some(li) = &mut self.login {
             li.zpw_sek = v;
+        }
+    }
+
+    /// Return the freshest `zpw_sek` (from `Set-Cookie`, `self.zpw_sek`, or `self.login`).
+    pub fn current_zpw_sek(&self) -> Option<String> {
+        if let Ok(g) = self.live_sek.read() {
+            if let Some(s) = &*g {
+                if !s.is_empty() && s != "EXPIRED" {
+                    return Some(s.clone());
+                }
+            }
+        }
+        self.zpw_sek
+            .clone()
+            .filter(|s| !s.is_empty() && s != "EXPIRED")
+            .or_else(|| {
+                self.login
+                    .as_ref()
+                    .map(|l| l.zpw_sek.clone())
+                    .filter(|s| !s.is_empty() && s != "EXPIRED")
+            })
+    }
+
+    /// Synchronize any newly captured `live_sek` back into `self.zpw_sek` and `self.login`.
+    pub fn sync_live_sek(&mut self) {
+        if let Some(sek) = self.current_zpw_sek() {
+            self.zpw_sek = Some(sek.clone());
+            if let Some(li) = &mut self.login {
+                li.zpw_sek = sek;
+            }
+        }
+    }
+
+    /// Parse `Set-Cookie` headers from a Zalo HTTP response, ignoring deletion cookies (`1970` / empty).
+    pub fn ingest_set_cookie_headers(&self, headers: &HeaderMap) {
+        for val in headers.get_all("set-cookie") {
+            let Ok(raw) = val.to_str() else { continue };
+            let lower = raw.to_ascii_lowercase();
+            if lower.contains("1970") || lower.contains("max-age=0") {
+                continue;
+            }
+            let first = raw.split(';').next().unwrap_or("").trim();
+            let Some((k, v)) = first.split_once('=') else { continue };
+            let name = k.trim();
+            let value = v.trim().trim_matches('"');
+            if name.is_empty() || value.is_empty() || value == "EXPIRED" {
+                continue;
+            }
+            if let Ok(mut m) = self.live_cookies.write() {
+                m.insert(name.to_string(), value.to_string());
+            }
+            if name == "zpw_sek" {
+                if let Ok(mut g) = self.live_sek.write() {
+                    *g = Some(value.to_string());
+                }
+                for host in [
+                    "https://chat.zalo.me",
+                    "https://wpa.zaloapp.com",
+                    "https://wpa.chat.zalo.me",
+                    &self.domains.auth,
+                    &self.domains.chat,
+                    &self.domains.conversation,
+                    &self.domains.lp_chat,
+                    &self.domains.lp_control,
+                    &self.domains.convers_api,
+                    &self.domains.profile,
+                    &self.domains.friend,
+                    &self.domains.group,
+                    &self.domains.cloud_msg,
+                ] {
+                    if let Ok(url) = reqwest::Url::parse(host) {
+                        self.jar.add_cookie_str(&format!("zpw_sek={value}; Path=/"), &url);
+                    }
+                }
+            }
         }
     }
 
@@ -674,6 +761,12 @@ impl Session {
         self.zpw_sek = None;
         self.secret_key = None;
         self.session_key = None;
+        if let Ok(mut g) = self.live_sek.write() {
+            *g = None;
+        }
+        if let Ok(mut m) = self.live_cookies.write() {
+            m.clear();
+        }
         self.jar = Arc::new(Jar::default());
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
@@ -702,13 +795,18 @@ impl Session {
     /// Save the authenticated session to disk so subsequent runs can restore it without re-authenticating.
     pub fn save_to_file(&self, path: &str) -> Result<()> {
         use base64::Engine;
+        let latest_sek = self.current_zpw_sek();
+        let mut saved_login = self.login.clone();
+        if let (Some(li), Some(sek)) = (&mut saved_login, &latest_sek) {
+            li.zpw_sek = sek.clone();
+        }
         let saved = SavedSession {
             imei: self.imei.clone(),
             computer_name: self.computer_name.clone(),
             secret_key_b64: self.secret_key.as_ref().map(|k| base64::engine::general_purpose::STANDARD.encode(k)),
             session_key: self.session_key.clone(),
-            zpw_sek: self.zpw_sek.clone(),
-            login: self.login.clone(),
+            zpw_sek: latest_sek,
+            login: saved_login,
             domains: self.domains.clone(),
             expired_at: self.expired_at,
         };
@@ -1051,27 +1149,38 @@ impl Session {
         }
         let method = m.as_str().to_string();
         let mut rb = self.http.request(m, url);
-        if let Some(ref sek) = self.zpw_sek {
-            if !sek.is_empty() {
-                let is_zalo_host = reqwest::Url::parse(url)
-                    .map(|u| {
-                        u.host_str()
-                            .map(|h| {
-                                h == "zalo.me"
-                                    || h.ends_with(".zalo.me")
-                                    || h == "zaloapp.com"
-                                    || h.ends_with(".zaloapp.com")
-                            })
-                            .unwrap_or(false)
+        let is_zalo_host = reqwest::Url::parse(url)
+            .map(|u| {
+                u.host_str()
+                    .map(|h| {
+                        h == "zalo.me"
+                            || h.ends_with(".zalo.me")
+                            || h == "zaloapp.com"
+                            || h.ends_with(".zaloapp.com")
                     })
-                    .unwrap_or_else(|_| url.contains("zalo.me") || url.contains("zaloapp.com"));
-                if is_zalo_host {
-                    rb = rb.header("Cookie", format!("zpw_sek={sek}; _zlang=vi"));
-                    rb = rb.header("zpw_sek", sek);
-                    rb = rb.header("Origin", "https://chat.zalo.me");
-                    rb = rb.header("Referer", "https://chat.zalo.me/");
+                    .unwrap_or(false)
+            })
+            .unwrap_or_else(|_| url.contains("zalo.me") || url.contains("zaloapp.com"));
+        if is_zalo_host {
+            let active_sek = self.current_zpw_sek();
+            let mut pairs = Vec::new();
+            if let Ok(m) = self.live_cookies.read() {
+                for (k, v) in m.iter() {
+                    if k != "zpw_sek" && k != "_zlang" && !v.is_empty() {
+                        pairs.push(format!("{k}={v}"));
+                    }
                 }
             }
+            if let Some(sek) = &active_sek {
+                if !sek.is_empty() {
+                    pairs.push(format!("zpw_sek={sek}"));
+                    rb = rb.header("zpw_sek", sek);
+                }
+            }
+            pairs.push("_zlang=vi".into());
+            rb = rb.header("Cookie", pairs.join("; "));
+            rb = rb.header("Origin", "https://chat.zalo.me");
+            rb = rb.header("Referer", "https://chat.zalo.me/");
         }
         if let Some(b) = &body {
             rb = rb
@@ -1097,6 +1206,7 @@ impl Session {
             }
         };
 
+        self.ingest_set_cookie_headers(resp.headers());
         let status = resp.status();
         let text = resp.text().await?;
         if self.verbose {
@@ -1626,5 +1736,42 @@ mod tests {
                 "error_code {code} must stop immediately without failover"
             );
         }
+    }
+
+    #[test]
+    fn ingest_set_cookie_headers_rotates_live_zpw_sek_and_ignores_1970_deletions() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.set_zpw_sek("OLD_QR_TICKET_SEK".into());
+        assert_eq!(s.current_zpw_sek().as_deref(), Some("OLD_QR_TICKET_SEK"));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(
+            reqwest::header::SET_COOKIE,
+            reqwest::header::HeaderValue::from_static(
+                "zpw_sek=NEW_LOGIN_SESSION_SEK; Path=/; Domain=.zalo.me; Secure; HttpOnly",
+            ),
+        );
+        headers.append(
+            reqwest::header::SET_COOKIE,
+            reqwest::header::HeaderValue::from_static(
+                "zpw_sek=; Path=/; Domain=.zaloapp.com; Expires=Thu, 01-Jan-1970 00:00:00 GMT",
+            ),
+        );
+        headers.append(
+            reqwest::header::SET_COOKIE,
+            reqwest::header::HeaderValue::from_static("zpsid=SID_999; Path=/; Domain=.zalo.me"),
+        );
+
+        // Notice `s` is an immutable `&Session`, just like inside `Session::send(&self)` and `get_login_info(&self)`.
+        let s_ref: &Session = &s;
+        s_ref.ingest_set_cookie_headers(&headers);
+        assert_eq!(s_ref.current_zpw_sek().as_deref(), Some("NEW_LOGIN_SESSION_SEK"));
+
+        s.sync_live_sek();
+        assert_eq!(s.zpw_sek.as_deref(), Some("NEW_LOGIN_SESSION_SEK"));
+        assert_eq!(
+            s.live_cookies.read().unwrap().get("zpsid").map(String::as_str),
+            Some("SID_999")
+        );
     }
 }

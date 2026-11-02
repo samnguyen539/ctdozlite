@@ -266,9 +266,26 @@ pub async fn confirm(s: &Session, q: &QrLogin) -> Result<Value> {
             .map_err(|e| anyhow::anyhow!("pc-status: không phải JSON ({e}): {}", crate::session::truncate(&text, 200)))?;
         let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
         if code == 0 {
+            if let Some(body_sek) = extract_zpw_sek(&v) {
+                if let Ok(mut g) = s.live_sek.write() {
+                    if g.is_none() {
+                        *g = Some(body_sek.clone());
+                    }
+                }
+                if let Ok(mut m) = s.live_cookies.write() {
+                    m.entry("zpw_sek".into()).or_insert(body_sek);
+                }
+            }
             if let Some(sek) = cookie_sek {
                 if let Some(d) = v.get_mut("data").and_then(Value::as_object_mut) {
-                    d.insert("zpw_sek".into(), Value::String(sek));
+                    let has_body_sek = d
+                        .get("zpw_sek")
+                        .and_then(Value::as_str)
+                        .map(|x| !x.is_empty() && x != "EXPIRED")
+                        .unwrap_or(false);
+                    if !has_body_sek {
+                        d.insert("zpw_sek".into(), Value::String(sek));
+                    }
                 }
             }
             return Ok(v);
@@ -320,6 +337,9 @@ pub async fn login_via_qr(s: &mut Session, language: &str) -> Result<Value> {
     if let Some(cfg) = info.get("data") {
         login::apply_login_config(s, cfg);
         s.apply_server_info(cfg);
+        s.sync_live_sek();
+        let _ = s.sync_profile_me().await;
+        s.sync_live_sek();
         println!("✓ Đã nạp khoá phiên zpw_enk và cập nhật endpoints!");
         if let Err(e) = s.save_to_file("session.json") {
             eprintln!("! Lỗi lưu session.json: {e}");
@@ -359,10 +379,14 @@ pub fn extract_zpw_sek(v: &Value) -> Option<String> {
 async fn get_raw(s: &Session, url: &str) -> Result<(u16, String, Option<String>)> {
     let resp = s.http.get(url).send().await?;
     let status = resp.status().as_u16();
-
+    s.ingest_set_cookie_headers(resp.headers());
     let mut sek = None;
     for val in resp.headers().get_all("set-cookie") {
         if let Ok(sc) = val.to_str() {
+            let lower = sc.to_ascii_lowercase();
+            if lower.contains("1970") || lower.contains("max-age=0") {
+                continue;
+            }
             if let Some(pos) = sc.find("zpw_sek=") {
                 let token = sc[pos + 8..].split(';').next().unwrap_or("").trim();
                 if !token.is_empty() && token != "EXPIRED" {
@@ -371,7 +395,6 @@ async fn get_raw(s: &Session, url: &str) -> Result<(u16, String, Option<String>)
             }
         }
     }
-
     let text = resp.text().await?;
     if s.verbose {
         eprintln!("→ GET {}", crate::session::redact_url(url));

@@ -23,6 +23,7 @@ pub struct QrFlowState {
     pub scanned_name: String,
     pub scanned_avatar: String,
     pub error: String,
+    pub generation: u64,
 }
 
 impl Default for QrFlowState {
@@ -35,6 +36,7 @@ impl Default for QrFlowState {
             scanned_name: String::new(),
             scanned_avatar: String::new(),
             error: String::new(),
+            generation: 0,
         }
     }
 }
@@ -53,6 +55,8 @@ static HUB: LazyLock<Mutex<Hub>> = LazyLock::new(|| {
         poll: PollState::default(),
     })
 });
+static SYNC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 
 fn qr_state() -> &'static std::sync::Mutex<QrFlowState> {
     &QR_STATE
@@ -69,7 +73,9 @@ fn set_qr(f: impl FnOnce(&mut QrFlowState)) {
 }
 
 fn is_live(s: &Session) -> bool {
-    s.login.is_some() && s.zpw_sek.is_some() && !s.is_expired_marked()
+    s.login.is_some()
+        && (s.zpw_sek.is_some() || s.current_zpw_sek().is_some())
+        && !s.is_expired_marked()
 }
 
 fn err(code: u16, msg: impl ToString) -> (u16, Value) {
@@ -120,27 +126,63 @@ fn fingerprint(threads: &[Thread]) -> (usize, i64) {
 
 /// Full friends + groups + last-message sync; replaces the in-memory thread list.
 pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thread>> {
+    let _guard = SYNC_LOCK.lock().await;
     let s = session.lock().await.clone();
-    let mut list = chat::get_friends(&s).await?;
+    let mut list = chat::get_friends(&s).await.unwrap_or_default();
     if let Ok(groups) = chat::get_groups(&s).await {
         list.extend(groups);
+    }
+    if let Some(li) = &s.login {
+        if !li.send2me_id.is_empty() && !list.iter().any(|t| t.id == li.send2me_id) {
+            list.insert(
+                0,
+                Thread {
+                    presentation: Default::default(),
+                    unread: Default::default(),
+                    id: li.send2me_id.clone(),
+                    name: "Cloud của tôi (Lưu trữ)".into(),
+                    preview: "".into(),
+                    time: crate::ui::clock(),
+                    avatar: None,
+                    is_group: false,
+                    messages: Vec::new(),
+                },
+            );
+        }
+    }
+    if list.is_empty() {
+        list = chat::load_threads_cache();
     }
     store::load_history_into_threads("zalo_history.db", &mut list, MessageStore::PRELOAD_MSGS);
     if let Ok(resp) = chat::get_last_msgs(&s, &[]).await {
         chat::merge_previews(&mut list, &resp);
     }
-    let ids: Vec<String> = list.iter().filter(|t| !t.id.is_empty()).map(|t| {
-        if t.is_group && !t.id.starts_with('g') && !t.id.starts_with("group_") { format!("g{}", t.id) } else { t.id.clone() }
-    }).collect();
+    let ids: Vec<String> = list
+        .iter()
+        .filter(|t| !t.id.is_empty())
+        .map(|t| {
+            if t.is_group && !t.id.starts_with('g') && !t.id.starts_with("group_") {
+                format!("g{}", t.id)
+            } else {
+                t.id.clone()
+            }
+        })
+        .collect();
     for chunk in ids.chunks(25) {
         if let Ok(resp) = chat::get_last_msgs(&s, chunk).await {
             chat::merge_previews(&mut list, &resp);
         }
     }
+    let mut poll = PollState::default();
+    let _ = chat::poll_new_messages(&s, &mut poll, &mut list).await;
     chat::resolve_thread_names(&s, &mut list).await;
     chat::deduplicate_threads(&mut list, None);
     persist(&list);
-    hub().lock().await.threads = list.clone();
+    let mut h = hub().lock().await;
+    h.threads = list.clone();
+    if !poll.last_action_id.is_empty() {
+        h.poll = poll;
+    }
     Ok(list)
 }
 
@@ -178,63 +220,163 @@ pub fn spawn_background(session: Arc<Mutex<Session>>) {
 }
 
 async fn qr_start(session: &Arc<Mutex<Session>>) -> (u16, Value) {
-    if let Ok(g) = qr_state().lock() {
-        if g.status == "waiting_scan" || g.status == "scanned" {
-            return (200, json!({ "ok": true, "token_id": g.token_id, "qr_payload": g.qr_payload, "qr_timeout": g.qr_timeout }));
+    {
+        let s = session.lock().await;
+        if is_live(&s) {
+            return (200, json!({ "ok": true, "qr_status": "connected", "logged_in": true }));
         }
     }
+    if let Ok(g) = qr_state().lock() {
+        if (g.status == "waiting_scan" || g.status == "scanned" || g.status == "authenticating")
+            && !g.qr_payload.is_empty()
+        {
+            return (
+                200,
+                json!({
+                    "ok": true,
+                    "token_id": g.token_id,
+                    "qr_payload": g.qr_payload,
+                    "qr_timeout": g.qr_timeout
+                }),
+            );
+        }
+    }
+    let mut my_gen = 0u64;
+    set_qr(|g| {
+        g.generation = g.generation.wrapping_add(1);
+        my_gen = g.generation;
+        g.status = "starting".into();
+        g.error.clear();
+    });
     let snap = session.lock().await.clone();
     let q = match crate::qr::request_qr(&snap, "vi").await {
         Ok(q) => q,
         Err(e) => {
-            set_qr(|g| { *g = QrFlowState { status: "error".into(), error: e.to_string(), ..Default::default() }; });
+            set_qr(|g| {
+                if g.generation == my_gen {
+                    g.status = "error".into();
+                    g.error = e.to_string();
+                }
+            });
             return err(502, e);
         }
     };
     set_qr(|g| {
-        *g = QrFlowState {
-            status: "waiting_scan".into(), token_id: q.token_id.clone(),
-            qr_payload: q.qr_payload.clone(), qr_timeout: q.qr_timeout, ..Default::default()
-        };
+        if g.generation == my_gen {
+            g.status = "waiting_scan".into();
+            g.token_id = q.token_id.clone();
+            g.qr_payload = q.qr_payload.clone();
+            g.qr_timeout = q.qr_timeout;
+            g.scanned_name.clear();
+            g.scanned_avatar.clear();
+            g.error.clear();
+        }
     });
-    let resp = json!({ "ok": true, "token_id": q.token_id, "qr_payload": q.qr_payload, "qr_timeout": q.qr_timeout });
+    let resp = json!({
+        "ok": true,
+        "token_id": q.token_id,
+        "qr_payload": q.qr_payload,
+        "qr_timeout": q.qr_timeout
+    });
     let sess = session.clone();
     tokio::spawn(async move {
-        if let Err(e) = qr_finish(&sess, &snap, &q).await {
-            set_qr(|g| { g.status = if e.to_string().contains("hết thời gian") { "expired" } else { "error" }.into(); g.error = e.to_string(); });
+        if let Err(e) = qr_finish(&sess, &snap, &q, my_gen).await {
+            set_qr(|g| {
+                if g.generation == my_gen && g.status != "connected" {
+                    g.status = if e.to_string().contains("hết thời gian") {
+                        "expired"
+                    } else {
+                        "error"
+                    }
+                    .into();
+                    g.error = e.to_string();
+                }
+            });
         }
     });
     (200, resp)
 }
 
-async fn qr_finish(sess: &Arc<Mutex<Session>>, snap: &Session, q: &crate::qr::QrLogin) -> anyhow::Result<()> {
+async fn qr_finish(
+    sess: &Arc<Mutex<Session>>,
+    snap: &Session,
+    q: &crate::qr::QrLogin,
+    my_gen: u64,
+) -> anyhow::Result<()> {
     let scanned = crate::qr::wait_for_scan(snap, q).await?;
-    let pick = |k: &[&str]| k.iter().find_map(|x| scanned.get(*x).and_then(Value::as_str)).unwrap_or("").to_string();
-    let (name, ava) = (pick(&["display_name", "displayName"]), pick(&["avatar", "avt"]));
-    set_qr(|g| { g.status = "scanned".into(); g.scanned_name = name; g.scanned_avatar = ava; });
+    let pick = |k: &[&str]| {
+        k.iter()
+            .find_map(|x| scanned.get(*x).and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string()
+    };
+    let (name, ava) = (
+        pick(&["display_name", "displayName"]),
+        pick(&["avatar", "avt"]),
+    );
+    set_qr(|g| {
+        if g.generation == my_gen {
+            g.status = "scanned".into();
+            g.scanned_name = name.clone();
+            g.scanned_avatar = ava.clone();
+        }
+    });
     let resp = crate::qr::confirm(snap, q).await?;
-    {
-        let mut s = sess.lock().await;
-        if let Some(sek) = crate::qr::extract_zpw_sek(&resp) {
+    set_qr(|g| {
+        if g.generation == my_gen {
+            g.status = "authenticating".into();
+        }
+    });
+    let mut s = snap.clone();
+    if let Some(sek) = crate::qr::extract_zpw_sek(&resp) {
+        s.set_zpw_sek(sek);
+    }
+    s.sync_live_sek();
+    if let Some(d) = resp.get("data") {
+        crate::login::apply_login_config(&mut s, d);
+    }
+    if let Ok(info) = crate::login::get_login_info(&s).await {
+        if let Some(sek) = crate::qr::extract_zpw_sek(&info) {
             s.set_zpw_sek(sek);
         }
-        if let Some(d) = resp.get("data") {
-            crate::login::apply_login_config(&mut s, d);
+        s.sync_live_sek();
+        if let Some(cfg) = info.get("data") {
+            crate::login::apply_login_config(&mut s, cfg);
+            s.apply_server_info(cfg);
         }
-        if let Ok(info) = crate::login::get_login_info(&s).await {
-            if let Some(sek) = crate::qr::extract_zpw_sek(&info) {
-                s.set_zpw_sek(sek);
-            }
-            if let Some(cfg) = info.get("data") {
-                crate::login::apply_login_config(&mut s, cfg);
-                s.apply_server_info(cfg);
-            }
-        }
-        let _ = s.sync_profile_me().await;
-        s.save_to_file("session.json")?;
     }
-    let _ = full_sync(sess).await;
-    set_qr(|g| g.status = "connected".into());
+    s.sync_live_sek();
+    if let Some(li) = &mut s.login {
+        if li.display_name.is_empty() && !name.is_empty() {
+            li.display_name = name.clone();
+        }
+        if li.avatar.is_empty() && !ava.is_empty() {
+            li.avatar = ava.clone();
+        }
+    }
+    let _ = s.sync_profile_me().await;
+    s.sync_live_sek();
+    if let Some(li) = &mut s.login {
+        if li.display_name.is_empty() && !name.is_empty() {
+            li.display_name = name;
+        }
+        if li.avatar.is_empty() && !ava.is_empty() {
+            li.avatar = ava;
+        }
+    }
+    s.save_to_file("session.json")?;
+    {
+        let mut global_s = sess.lock().await;
+        *global_s = s;
+    }
+    set_qr(|g| {
+        g.status = "connected".into();
+        g.error.clear();
+    });
+    let sess_bg = sess.clone();
+    tokio::spawn(async move {
+        let _ = full_sync(&sess_bg).await;
+    });
     Ok(())
 }
 
@@ -369,7 +511,13 @@ pub async fn route(
             let _ = std::fs::remove_file("session.json");
             let _ = std::fs::remove_file("threads_cache.json");
             *hub().lock().await = Hub::default();
-            set_qr(|g| *g = QrFlowState::default());
+            set_qr(|g| {
+                let next_gen = g.generation.wrapping_add(1);
+                *g = QrFlowState {
+                    generation: next_gen,
+                    ..Default::default()
+                };
+            });
             (200, json!({ "ok": true }))
         }
         ("POST", "/api/v1/sync") => match full_sync(session).await {

@@ -812,6 +812,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         {
                                                             s.set_zpw_sek(sek);
                                                         }
+                                                        s.sync_live_sek();
                                                         if let Some(data) = resp.get("data") {
                                                             crate::login::apply_login_config(
                                                                 &mut s, data,
@@ -822,6 +823,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                         if let Ok(info) =
                                                             crate::login::get_login_info(&s).await
                                                         {
+                                                            if let Some(sek) =
+                                                                crate::qr::extract_zpw_sek(&info)
+                                                            {
+                                                                s.set_zpw_sek(sek);
+                                                            }
+                                                            s.sync_live_sek();
                                                             if let Some(cfg) = info.get("data") {
                                                                 crate::login::apply_login_config(
                                                                     &mut s, cfg,
@@ -829,9 +836,17 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                                 s.apply_server_info(cfg);
                                                             }
                                                         }
+                                                        s.sync_live_sek();
                                                         let _ = s.sync_profile_me().await;
+                                                        s.sync_live_sek();
+                                                        if let Some(li) = &mut s.login {
+                                                            if li.display_name.is_empty()
+                                                                && !name.is_empty()
+                                                            {
+                                                                li.display_name = name.to_string();
+                                                            }
+                                                        }
                                                         let _ = s.save_to_file("session.json");
-
                                                         let uin = s
                                                             .login
                                                             .as_ref()
