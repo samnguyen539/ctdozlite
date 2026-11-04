@@ -3783,13 +3783,14 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                 && !t.name.contains("Cloud của tôi")
                 && (t.name.starts_with("Người dùng ")
                     || t.name.is_empty()
-                    || t.avatar.as_deref().unwrap_or("").is_empty())
+                    || (t.avatar.as_deref().unwrap_or("").is_empty()
+                        && (!t.messages.is_empty() || !t.preview.is_empty())))
         })
         .map(|t| t.id.clone())
         .collect();
 
     if !unknown_ids.is_empty() {
-        for chunk in unknown_ids.chunks(50) {
+        for chunk in unknown_ids.chunks(50).take(2) {
             if let Ok(profiles) = get_mini_profiles(s, chunk).await {
                 for t in threads.iter_mut() {
                     if let Some(p) = profiles.get(&t.id) {
@@ -3818,14 +3819,13 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
         .filter(|t| {
             t.is_group
                 && (is_generic_thread_name(&t.name)
-                    || t.preview.is_empty()
-                    || t.avatar.as_deref().unwrap_or("").is_empty())
+                    || (t.avatar.as_deref().unwrap_or("").is_empty() && t.preview.is_empty()))
         })
         .map(|t| t.id.clone())
         .collect();
 
     if !unknown_group_ids.is_empty() {
-        for chunk in unknown_group_ids.chunks(50) {
+        for chunk in unknown_group_ids.chunks(50).take(2) {
             if let Ok((info_map, _)) = fetch_group_profiles(s, chunk).await {
                 let mut need_mem_uids: Vec<String> = Vec::new();
                 for t in threads.iter_mut() {
@@ -4228,7 +4228,7 @@ pub async fn poll_new_messages(
     }
     let known_ids: Vec<String> = threads
         .iter()
-        .filter(|t| !t.id.is_empty())
+        .filter(|t| !t.id.is_empty() && t.preview.is_empty() && t.messages.is_empty())
         .map(|t| {
             if t.is_group && !t.id.starts_with('g') && !t.id.starts_with("group_") {
                 format!("g{}", t.id)
@@ -4237,7 +4237,7 @@ pub async fn poll_new_messages(
             }
         })
         .collect();
-    for chunk in known_ids.chunks(25) {
+    for chunk in known_ids.chunks(25).take(2) {
         if let Ok(preview_resp) = get_last_msgs(s, chunk).await {
             merge_previews(threads, &preview_resp);
         }
@@ -4259,8 +4259,9 @@ pub async fn poll_new_messages(
     }
     let group_ids: Vec<String> = threads
         .iter()
-        .filter(|t| t.is_group && !t.id.is_empty())
+        .filter(|t| t.is_group && !t.id.is_empty() && t.messages.is_empty() && !t.preview.is_empty())
         .map(|t| t.id.clone())
+        .take(6)
         .collect();
     for gid in group_ids {
         if let Ok(cm_resp) = get_cloud_messages(s, &gid, "0", false, 50).await {

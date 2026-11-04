@@ -56,8 +56,35 @@ static HUB: LazyLock<Mutex<Hub>> = LazyLock::new(|| {
     })
 });
 static SYNC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static LAST_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_PREVIEW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
+async fn sync_and_persist_session(session: &Arc<Mutex<Session>>) {
+    let mut g = session.lock().await;
+    let old_sek = g.zpw_sek.clone();
+    g.sync_live_sek();
+    if g.zpw_sek != old_sek && g.zpw_sek.is_some() {
+        let _ = g.save_to_file("session.json");
+    }
+}
+
+async fn confirm_and_mark_expired(session: &Arc<Mutex<Session>>, s: &Session) -> bool {
+    if s.session_status().await == crate::session::SessionStatus::Expired {
+        let mut g = session.lock().await;
+        g.mark_expired();
+        let _ = g.save_to_file("session.json");
+        true
+    } else {
+        false
+    }
+}
 fn qr_state() -> &'static std::sync::Mutex<QrFlowState> {
     &QR_STATE
 }
@@ -119,7 +146,8 @@ fn persist(threads: &[Thread]) {
 
 fn fingerprint(threads: &[Thread]) -> (usize, i64) {
     (
-        threads.len() + threads.iter().map(|t| t.messages.len()).sum::<usize>(),
+        threads.len()
+            + threads.iter().map(|t| t.messages.len() + t.preview.len()).sum::<usize>(),
         threads.iter().flat_map(|t| t.messages.iter().map(|m| m.ts)).max().unwrap_or(0),
     )
 }
@@ -128,33 +156,33 @@ fn fingerprint(threads: &[Thread]) -> (usize, i64) {
 pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thread>> {
     let _guard = SYNC_LOCK.lock().await;
     let s = session.lock().await.clone();
-    if s.session_status().await == crate::session::SessionStatus::Expired {
-        let mut g = session.lock().await;
-        g.mark_expired();
-        let _ = g.save_to_file("session.json");
+    if confirm_and_mark_expired(session, &s).await {
         anyhow::bail!("Phiên Zalo đã hết hạn (zpw_sek không còn hiệu lực)");
     }
-    let mut list = match chat::get_friends(&s).await {
-        Ok(v) => v,
+    let mut list = chat::load_threads_cache();
+    match chat::get_friends(&s).await {
+        Ok(friends) => {
+            for ft in friends {
+                if let Some(ex) = list.iter_mut().find(|t| t.id == ft.id) {
+                    if !ft.name.is_empty() {
+                        ex.name = ft.name;
+                    }
+                    if chat::should_replace_avatar(ex.avatar.as_deref(), ft.avatar.as_deref()) {
+                        ex.avatar = ft.avatar;
+                    }
+                    ex.is_group = ex.is_group || ft.is_group;
+                } else {
+                    list.push(ft);
+                }
+            }
+        }
         Err(e) => {
-            if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired {
-                let mut g = session.lock().await;
-                g.mark_expired();
-                let _ = g.save_to_file("session.json");
+            if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired
+                && confirm_and_mark_expired(session, &s).await
+            {
                 return Err(e);
             }
-            Vec::new()
         }
-    };
-    match chat::get_groups(&s).await {
-        Ok(groups) => list.extend(groups),
-        Err(e) if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired => {
-            let mut g = session.lock().await;
-            g.mark_expired();
-            let _ = g.save_to_file("session.json");
-            return Err(e);
-        }
-        Err(_) => {}
     }
     if let Some(li) = &s.login {
         if !li.send2me_id.is_empty() && !list.iter().any(|t| t.id == li.send2me_id) {
@@ -174,34 +202,15 @@ pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thre
             );
         }
     }
-    if list.is_empty() {
-        list = chat::load_threads_cache();
-    }
     store::load_history_into_threads("zalo_history.db", &mut list, MessageStore::PRELOAD_MSGS);
-    if let Ok(resp) = chat::get_last_msgs(&s, &[]).await {
-        chat::merge_previews(&mut list, &resp);
-    }
-    let ids: Vec<String> = list
-        .iter()
-        .filter(|t| !t.id.is_empty())
-        .map(|t| {
-            if t.is_group && !t.id.starts_with('g') && !t.id.starts_with("group_") {
-                format!("g{}", t.id)
-            } else {
-                t.id.clone()
-            }
-        })
-        .collect();
-    for chunk in ids.chunks(25) {
-        if let Ok(resp) = chat::get_last_msgs(&s, chunk).await {
-            chat::merge_previews(&mut list, &resp);
-        }
-    }
     let mut poll = PollState::default();
     let _ = chat::poll_new_messages(&s, &mut poll, &mut list).await;
-    chat::resolve_thread_names(&s, &mut list).await;
     chat::deduplicate_threads(&mut list, None);
     persist(&list);
+    sync_and_persist_session(session).await;
+    let now = now_ms();
+    LAST_POLL_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+    LAST_PREVIEW_MS.store(now, std::sync::atomic::Ordering::Relaxed);
     let mut h = hub().lock().await;
     h.threads = list.clone();
     if !poll.last_action_id.is_empty() {
@@ -210,24 +219,79 @@ pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thre
     Ok(list)
 }
 
-/// One poll round; returns whether anything changed.
+/// One lightweight poll round; returns whether anything changed.
 pub async fn poll_once(session: &Arc<Mutex<Session>>) -> anyhow::Result<bool> {
+    let _guard = SYNC_LOCK.lock().await;
+    let now = now_ms();
+    let last = LAST_POLL_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) < 2500 {
+        return Ok(false);
+    }
+    LAST_POLL_MS.store(now, std::sync::atomic::Ordering::Relaxed);
     let s = session.lock().await.clone();
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
     let mut h = hub().lock().await;
+    if h.threads.is_empty() {
+        h.threads = chat::load_threads_cache();
+        store::load_history_into_threads("zalo_history.db", &mut h.threads, MessageStore::PRELOAD_MSGS);
+    }
     let before = fingerprint(&h.threads);
     let Hub { threads, poll } = &mut *h;
-    if let Err(e) = chat::poll_new_messages(&s, poll, threads).await {
-        if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired {
-            let mut g = session.lock().await;
-            g.mark_expired();
-            let _ = g.save_to_file("session.json");
+    let mut got_lp = false;
+    for _ in 0..3 {
+        match chat::get_chat_from_polling(&s, poll).await {
+            Ok(lp_resp) => {
+                got_lp = true;
+                chat::merge_previews(threads, &lp_resp);
+                let data_node = lp_resp.get("data").unwrap_or(&lp_resp);
+                let more = data_node.get("more").and_then(Value::as_i64).unwrap_or(0);
+                let has_reset = data_node
+                    .get("resetLastActionId")
+                    .and_then(Value::as_str)
+                    .map(|r| r != "0" && !r.is_empty())
+                    .unwrap_or(false);
+                if more == 0 && !has_reset {
+                    break;
+                }
+            }
+            Err(e) => {
+                if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired
+                    && confirm_and_mark_expired(session, &s).await
+                {
+                    return Err(e);
+                }
+                break;
+            }
         }
-        return Err(e);
     }
-    Ok(before != fingerprint(&h.threads))
+    let last_prev = LAST_PREVIEW_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if got_lp || now.saturating_sub(last_prev) >= 20_000 {
+        LAST_PREVIEW_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+        match chat::get_last_msgs(&s, &[]).await {
+            Ok(preview_resp) => chat::merge_previews(threads, &preview_resp),
+            Err(e) => {
+                if crate::session::SessionStatus::from_error(&e) == crate::session::SessionStatus::Expired
+                    && confirm_and_mark_expired(session, &s).await
+                {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    let changed = before != fingerprint(threads);
+    if changed {
+        chat::resolve_thread_names(&s, threads).await;
+        chat::deduplicate_threads(threads, None);
+        persist(threads);
+    }
+    drop(h);
+    sync_and_persist_session(session).await;
+    Ok(changed)
 }
 
-/// Startup refresh + 4-second poll loop.
+/// Startup refresh + background standby poll loop.
 pub fn spawn_background(session: Arc<Mutex<Session>>) {
     tokio::spawn(async move {
         {
@@ -235,6 +299,7 @@ pub fn spawn_background(session: Arc<Mutex<Session>>) {
             if is_live(&s) {
                 let _ = crate::login::get_server_info(&mut s).await;
                 let _ = s.sync_profile_me().await;
+                s.sync_live_sek();
                 let _ = s.save_to_file("session.json");
             }
         }
@@ -242,8 +307,9 @@ pub fn spawn_background(session: Arc<Mutex<Session>>) {
             let _ = full_sync(&session).await;
         }
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-            if is_live(&*session.lock().await) {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            let last = LAST_POLL_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms().saturating_sub(last) >= 6000 && is_live(&*session.lock().await) {
                 let _ = poll_once(&session).await;
             }
         }
@@ -471,6 +537,7 @@ async fn send(session: &Arc<Mutex<Session>>, p: &Value) -> (u16, Value) {
     } else {
         chat::send_message(&s, to, text).await
     };
+    sync_and_persist_session(session).await;
     match res {
         Ok(r) => (200, json!({ "ok": true, "to_id": to, "response": r })),
         Err(e) => err(502, e),
