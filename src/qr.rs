@@ -354,19 +354,15 @@ pub async fn login_via_qr(s: &mut Session, language: &str) -> Result<Value> {
 }
 
 pub fn extract_zpw_sek(v: &Value) -> Option<String> {
-    for key in ["zpw_sek", "zpw_kt", "zpw_wpsk", "token", "session_key"] {
-        if let Some(s) = v.get(key).and_then(Value::as_str) {
-            if !s.is_empty() && s != "EXPIRED" {
-                return Some(s.to_string());
-            }
-        }
-        if let Some(s) = v.get("data").and_then(|d| d.get(key)).and_then(Value::as_str) {
-            if !s.is_empty() && s != "EXPIRED" {
-                return Some(s.to_string());
-            }
-        }
-        if let Some(s) = v.get("data").and_then(|d| d.get("account")).and_then(|a| a.get(key)).and_then(Value::as_str) {
-            if !s.is_empty() && s != "EXPIRED" {
+    for candidate in [
+        v.get("zpw_sek"),
+        v.get("data").and_then(|d| d.get("zpw_sek")),
+        v.get("data")
+            .and_then(|d| d.get("account"))
+            .and_then(|a| a.get("zpw_sek")),
+    ] {
+        if let Some(s) = candidate.and_then(Value::as_str) {
+            if !s.is_empty() && s != "EXPIRED" && !s.starts_with("zaloqr:") {
                 return Some(s.to_string());
             }
         }
@@ -496,5 +492,38 @@ mod tests {
     fn missing_wait_url_is_rejected() {
         let v = json!({"qr_cnt": "http://x/"});
         assert!(QrLogin::from_data(&v).is_err());
+    }
+
+    #[test]
+    fn extract_zpw_sek_ignores_zpw_wpsk_and_qr_token() {
+        let get_login_info_resp = json!({
+            "error_code": 0,
+            "data": {
+                "uid": "1781729582636652991",
+                "zpw_enk": "egtv37xayuoonqbTtYqpgQ==",
+                "zpw_wpsk": "BKUy1iXpdwbDlU6PgfEvd_iMoFXt9oxA7qu-sCIOZ6ml2",
+                "token": "zaloqr:v2_D4rELJCKc2unDpao"
+            }
+        });
+        assert_eq!(extract_zpw_sek(&get_login_info_resp), None);
+
+        let qr_ticket_resp = json!({
+            "error_code": 0,
+            "data": {
+                "zpw_sek": "zaloqr:v2_D4rELJCKc2unDpao"
+            }
+        });
+        assert_eq!(extract_zpw_sek(&qr_ticket_resp), None);
+
+        let confirm_resp = json!({
+            "error_code": 0,
+            "data": {
+                "zpw_sek": "s67S.192075927.a0.FYo49pRXY7orb0qH0qn"
+            }
+        });
+        assert_eq!(
+            extract_zpw_sek(&confirm_resp).as_deref(),
+            Some("s67S.192075927.a0.FYo49pRXY7orb0qH0qn")
+        );
     }
 }

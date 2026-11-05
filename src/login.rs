@@ -234,7 +234,7 @@ pub async fn get_login_info(s: &Session) -> Result<Value> {
 
     // Try both auth host (wpa.zaloapp.com, where PC session cookies live)
     // and wpa_chat (wpa.chat.zalo.me, where web session cookies live).
-    let hosts = [&s.domains.auth, &s.domains.wpa_chat];
+    let hosts = [&s.domains.wpa_chat, &s.domains.auth];
     let mut last_err = anyhow::anyhow!("get_login_info failed on all hosts");
 
     for host in hosts {
@@ -260,40 +260,42 @@ pub async fn get_login_info(s: &Session) -> Result<Value> {
 /// Pull `dkey` / `zpw_enk` / domains out of a login response payload.
 /// Preserves already established session credentials if the new payload only contains partial fields.
 pub fn apply_login_config(s: &mut Session, cfg: &Value) {
-    let new_dkey = cfg
-        .get("uid")
-        .or_else(|| cfg.get("userId"))
-        .or_else(|| cfg.get("account").and_then(|a| a.get("userId").or_else(|| a.get("uid"))))
-        .or_else(|| cfg.get("dkey"))
-        .and_then(as_str)
-        .unwrap_or_default();
-    let new_phone = cfg
-        .get("phone_number")
-        .or_else(|| cfg.get("phone"))
-        .or_else(|| {
-            cfg.get("account")
-                .and_then(|a| a.get("phone_number").or_else(|| a.get("phone")))
-        })
-        .and_then(as_str)
-        .unwrap_or_default();
+    let pick_str = |vals: &[Option<&Value>]| -> String {
+        vals.iter()
+            .flatten()
+            .find_map(|v| as_str(v))
+            .filter(|s| !s.is_empty() && *s != "EXPIRED")
+            .unwrap_or_default()
+    };
+    let new_dkey = pick_str(&[
+        cfg.get("uid"),
+        cfg.get("userId"),
+        cfg.get("account").and_then(|a| a.get("userId")),
+        cfg.get("account").and_then(|a| a.get("uid")),
+        cfg.get("dkey"),
+    ]);
+    let new_phone = pick_str(&[
+        cfg.get("phone_number"),
+        cfg.get("phone"),
+        cfg.get("account").and_then(|a| a.get("phone_number")),
+        cfg.get("account").and_then(|a| a.get("phone")),
+    ]);
 
-    let new_enk = cfg.get("zpw_enk").and_then(as_str).unwrap_or_default();
-    let new_send2me_id = cfg.get("send2me_id").and_then(as_str).unwrap_or_default();
+    let new_enk = pick_str(&[cfg.get("zpw_enk")]);
+    let new_send2me_id = pick_str(&[cfg.get("send2me_id")]);
 
-    let new_sek = cfg
-        .get("zpw_sek")
-        .or_else(|| cfg.get("account").and_then(|a| a.get("zpw_sek")))
-        .and_then(as_str)
-        .unwrap_or_default();
+    let new_sek = pick_str(&[
+        cfg.get("zpw_sek"),
+        cfg.get("account").and_then(|a| a.get("zpw_sek")),
+    ]);
 
-    let new_name = cfg
-        .get("account")
-        .and_then(|a| a.get("display_name"))
-        .or_else(|| cfg.get("display_name"))
-        .or_else(|| cfg.get("settings").and_then(|st| st.get("profile")).and_then(|p| p.get("name")))
-        .and_then(as_str)
-        .unwrap_or_default();
-
+    let new_name = pick_str(&[
+        cfg.get("account").and_then(|a| a.get("display_name")),
+        cfg.get("display_name"),
+        cfg.get("settings")
+            .and_then(|st| st.get("profile"))
+            .and_then(|p| p.get("name")),
+    ]);
     if !new_enk.is_empty() {
         let raw = crate::crypto::parse_secret_key(&new_enk);
         s.secret_key = Some(raw);
@@ -413,5 +415,29 @@ mod tests {
         assert_eq!(s.zpw_sek.as_deref(), Some("sek_nested_456"));
         let login = s.login.as_ref().unwrap();
         assert_eq!(login.zpw_sek, "sek_nested_456");
+    }
+
+    #[test]
+    fn apply_login_config_preserves_cookie_zpw_sek_when_payload_only_has_zpw_wpsk() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.set_zpw_sek("s67S.192075927.a0.FYo49pRXY7orb0qH0qn".into());
+        let cfg = serde_json::json!({
+            "uid": "1781729582636652991",
+            "zpw_enk": "egtv37xayuoonqbTtYqpgQ==",
+            "zpw_wpsk": "BKUy1iXpdwbDlU6PgfEvd_iMoFXt9oxA7qu-sCIOZ6ml2",
+            "phone_number": "84987204169",
+            "send2me_id": "123118114094435507"
+        });
+        apply_login_config(&mut s, &cfg);
+        assert_eq!(
+            s.zpw_sek.as_deref(),
+            Some("s67S.192075927.a0.FYo49pRXY7orb0qH0qn")
+        );
+        let login = s.login.as_ref().unwrap();
+        assert_eq!(login.zpw_sek, "s67S.192075927.a0.FYo49pRXY7orb0qH0qn");
+        assert_eq!(login.uin, "1781729582636652991");
+        assert_eq!(login.zpw_enk, "egtv37xayuoonqbTtYqpgQ==");
+        assert_eq!(login.phone, "84987204169");
+        assert_eq!(login.send2me_id, "123118114094435507");
     }
 }

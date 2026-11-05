@@ -515,6 +515,15 @@ impl Session {
         })
     }
 
+    /// Create a fresh session for QR login with an isolated cookie jar (`Arc<Jar>`),
+    /// `live_sek`, and `live_cookies`, preserving `imei` and `computer_name`.
+    pub fn fresh_for_qr(&self) -> Result<Self> {
+        let mut fresh = Self::new(self.verbose, self.dump, self.dump_raw)?;
+        fresh.imei = self.imei.clone();
+        fresh.computer_name = self.computer_name.clone();
+        Ok(fresh)
+    }
+
     /// Store `zpw_sek` session token, attach it to `self.login`, and insert the session cookie.
     pub fn set_zpw_sek(&mut self, v: String) {
         if v.is_empty() {
@@ -543,10 +552,17 @@ impl Session {
         ];
         for host in hosts {
             if let Ok(url) = reqwest::Url::parse(host) {
-                let cookie = format!("zpw_sek={v}; Path=/");
-                self.jar.add_cookie_str(&cookie, &url);
+                self.jar.add_cookie_str("zpw_sek=; Path=/; Max-Age=0", &url);
             }
         }
+        self.jar.add_cookie_str(
+            &format!("zpw_sek={v}; Path=/; Domain=zalo.me; Secure"),
+            &reqwest::Url::parse("https://chat.zalo.me").unwrap(),
+        );
+        self.jar.add_cookie_str(
+            &format!("zpw_sek={v}; Path=/; Domain=zaloapp.com; Secure"),
+            &reqwest::Url::parse("https://wpa.zaloapp.com").unwrap(),
+        );
         if let Ok(mut g) = self.live_sek.write() {
             *g = Some(v.clone());
         }
@@ -611,10 +627,13 @@ impl Session {
                 if let Ok(mut g) = self.live_sek.write() {
                     *g = Some(value.to_string());
                 }
-                for host in [
+                let hosts = [
                     "https://chat.zalo.me",
                     "https://wpa.zaloapp.com",
                     "https://wpa.chat.zalo.me",
+                    "https://tt-sticker-wpa.chat.zalo.me",
+                    "https://tt-sticker-wpa.zaloapp.com",
+                    "https://sticker-wpa.chat.zalo.me",
                     &self.domains.auth,
                     &self.domains.chat,
                     &self.domains.conversation,
@@ -625,11 +644,22 @@ impl Session {
                     &self.domains.friend,
                     &self.domains.group,
                     &self.domains.cloud_msg,
-                ] {
+                    &self.domains.voice_call,
+                    &self.domains.sticker,
+                ];
+                for host in hosts {
                     if let Ok(url) = reqwest::Url::parse(host) {
-                        self.jar.add_cookie_str(&format!("zpw_sek={value}; Path=/"), &url);
+                        self.jar.add_cookie_str("zpw_sek=; Path=/; Max-Age=0", &url);
                     }
                 }
+                self.jar.add_cookie_str(
+                    &format!("zpw_sek={value}; Path=/; Domain=zalo.me; Secure"),
+                    &reqwest::Url::parse("https://chat.zalo.me").unwrap(),
+                );
+                self.jar.add_cookie_str(
+                    &format!("zpw_sek={value}; Path=/; Domain=zaloapp.com; Secure"),
+                    &reqwest::Url::parse("https://wpa.zaloapp.com").unwrap(),
+                );
             }
         }
     }
@@ -666,28 +696,51 @@ impl Session {
             "avatar_size": 160,
             "imei": self.imei,
         });
-        let url = match self.encoded_params(&body) {
-            Ok(enc) => format!(
-                "{}/api/social/profile/me-v2?{}&params={enc}&os=8",
-                self.domains.profile,
-                self.common_params()
-            ),
-            Err(_) => format!(
-                "{}/api/social/profile/me-v2?{}",
-                self.domains.profile,
-                self.common_params()
-            ),
-        };
-        let resp = match self.get(&url).await {
-            Ok(r) => r,
-            Err(e) => return SessionStatus::from_error(&e),
-        };
-        // `me-v2` answers param-encrypted requests with a base64 body, so decode before
-        // reading the code — otherwise a live session looks like a malformed response.
-        let dec = self.maybe_decrypt(resp, self.session_key_bytes()).await;
-        match dec.get("error_code").and_then(serde_json::Value::as_i64) {
-            Some(code) => SessionStatus::from_error_code(code),
-            None => SessionStatus::Unreachable,
+        let mut candidates: Vec<&str> = Vec::new();
+        for host in [
+            self.domains.profile.as_str(),
+            "https://tt-profile-wpa.chat.zalo.me",
+            "https://tt-profile-wpa.zaloapp.com",
+        ] {
+            let trimmed = host.trim_end_matches('/');
+            if !trimmed.is_empty() && !candidates.contains(&trimmed) {
+                candidates.push(trimmed);
+            }
+        }
+        let mut saw_expired = false;
+        for host in candidates {
+            let url = match self.encoded_params(&body) {
+                Ok(ref enc) => format!(
+                    "{host}/api/social/profile/me-v2?{}&params={enc}&os=8",
+                    self.common_params()
+                ),
+                Err(_) => format!(
+                    "{host}/api/social/profile/me-v2?{}",
+                    self.common_params()
+                ),
+            };
+            let status = match self.get(&url).await {
+                Ok(resp) => {
+                    // `me-v2` answers param-encrypted requests with a base64 body, so decode before
+                    // reading the code — otherwise a live session looks like a malformed response.
+                    let dec = self.maybe_decrypt(resp, self.session_key_bytes()).await;
+                    match dec.get("error_code").and_then(serde_json::Value::as_i64) {
+                        Some(code) => SessionStatus::from_error_code(code),
+                        None => SessionStatus::Unreachable,
+                    }
+                }
+                Err(e) => SessionStatus::from_error(&e),
+            };
+            match status {
+                SessionStatus::Valid => return SessionStatus::Valid,
+                SessionStatus::Expired => saw_expired = true,
+                SessionStatus::Unreachable => {}
+            }
+        }
+        if saw_expired {
+            SessionStatus::Expired
+        } else {
+            SessionStatus::Unreachable
         }
     }
 
@@ -876,6 +929,9 @@ impl Session {
         if !saved.cookies.is_empty() {
             if let Ok(mut map) = self.live_cookies.write() {
                 for (k, v) in &saved.cookies {
+                    if k == "zpw_sek" {
+                        continue;
+                    }
                     map.insert(k.clone(), v.clone());
                 }
             }
@@ -883,6 +939,9 @@ impl Session {
                 if let Ok(url) = reqwest::Url::parse(host) {
                     let domain = if host.contains("zaloapp.com") { ".zaloapp.com" } else { ".zalo.me" };
                     for (k, v) in &saved.cookies {
+                        if k == "zpw_sek" {
+                            continue;
+                        }
                         self.jar.add_cookie_str(&format!("{k}={v}; Path=/; Domain={domain}; Secure"), &url);
                     }
                 }
@@ -1806,5 +1865,46 @@ mod tests {
             restored.live_cookies.read().unwrap().get("zpsid").map(String::as_str),
             Some("SID_999")
         );
+    }
+
+    #[test]
+    fn set_zpw_sek_replaces_domain_cookie_without_duplicates() {
+        use reqwest::cookie::CookieStore;
+        use reqwest::Url;
+
+        let mut s = Session::new(false, false, false).unwrap();
+        s.jar.add_cookie_str(
+            "zpw_sek=old_val; Path=/; Domain=zaloapp.com; Secure",
+            &Url::parse("https://wpa.zaloapp.com").unwrap(),
+        );
+        s.set_zpw_sek("new_val".into());
+
+        for host in [
+            "https://wpa.zaloapp.com",
+            "https://wpa.chat.zalo.me",
+            "https://tt-group-wpa.zaloapp.com",
+        ] {
+            let url = Url::parse(host).unwrap();
+            let hdr = s
+                .jar
+                .cookies(&url)
+                .expect("cookie header should exist")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                hdr.contains("zpw_sek=new_val"),
+                "expected zpw_sek=new_val for {host}, got: {hdr}"
+            );
+            assert!(
+                !hdr.contains("old_val"),
+                "unexpected old_val for {host}, got: {hdr}"
+            );
+            assert_eq!(
+                hdr.matches("zpw_sek=").count(),
+                1,
+                "expected single zpw_sek= entry for {host}, got: {hdr}"
+            );
+        }
     }
 }

@@ -137,6 +137,16 @@ fn thread_json(t: &Thread, msg_limit: usize) -> Value {
     })
 }
 
+fn sort_threads(list: &mut [Thread]) {
+    list.sort_by(|a, b| {
+        let ts_a = a.presentation.last_message_ts.max(a.messages.iter().map(|m| m.ts).max().unwrap_or(0));
+        let ts_b = b.presentation.last_message_ts.max(b.messages.iter().map(|m| m.ts).max().unwrap_or(0));
+        ts_b.cmp(&ts_a)
+            .then_with(|| (!b.messages.is_empty()).cmp(&!a.messages.is_empty()))
+            .then_with(|| (!b.preview.is_empty()).cmp(&!a.preview.is_empty()))
+    });
+}
+
 fn persist(threads: &[Thread]) {
     if let Ok(mut st) = MessageStore::open("zalo_history.db") {
         let _ = store::persist_threads(&mut st, threads);
@@ -206,6 +216,7 @@ pub async fn full_sync(session: &Arc<Mutex<Session>>) -> anyhow::Result<Vec<Thre
     let mut poll = PollState::default();
     let _ = chat::poll_new_messages(&s, &mut poll, &mut list).await;
     chat::deduplicate_threads(&mut list, None);
+    sort_threads(&mut list);
     persist(&list);
     sync_and_persist_session(session).await;
     let now = now_ms();
@@ -284,6 +295,7 @@ pub async fn poll_once(session: &Arc<Mutex<Session>>) -> anyhow::Result<bool> {
     if changed {
         chat::resolve_thread_names(&s, threads).await;
         chat::deduplicate_threads(threads, None);
+        sort_threads(threads);
         persist(threads);
     }
     drop(h);
@@ -345,7 +357,13 @@ async fn qr_start(session: &Arc<Mutex<Session>>) -> (u16, Value) {
         g.status = "starting".into();
         g.error.clear();
     });
-    let snap = session.lock().await.clone();
+    let snap = {
+        let s = session.lock().await;
+        match s.fresh_for_qr() {
+            Ok(x) => x,
+            Err(e) => return (500, json!({ "ok": false, "error": e.to_string() })),
+        }
+    };
     let q = match crate::qr::request_qr(&snap, "vi").await {
         Ok(q) => q,
         Err(e) => {
@@ -432,17 +450,32 @@ async fn qr_finish(
     if let Some(d) = resp.get("data") {
         crate::login::apply_login_config(&mut s, d);
     }
-    if let Ok(info) = crate::login::get_login_info(&s).await {
-        if let Some(sek) = crate::qr::extract_zpw_sek(&info) {
-            s.set_zpw_sek(sek);
+    for attempt in 0..2 {
+        if let Ok(info) = crate::login::get_login_info(&s).await {
+            if let Some(sek) = crate::qr::extract_zpw_sek(&info) {
+                s.set_zpw_sek(sek);
+            }
+            s.sync_live_sek();
+            if let Some(cfg) = info.get("data") {
+                crate::login::apply_login_config(&mut s, cfg);
+                s.apply_server_info(cfg);
+                s.sync_live_sek();
+                if let Some(sek) = s.current_zpw_sek() {
+                    s.set_zpw_sek(sek);
+                }
+            }
+            if s.secret_key.is_some() {
+                break;
+            }
         }
-        s.sync_live_sek();
-        if let Some(cfg) = info.get("data") {
-            crate::login::apply_login_config(&mut s, cfg);
-            s.apply_server_info(cfg);
+        if attempt == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     }
     s.sync_live_sek();
+    if let Some(sek) = s.current_zpw_sek() {
+        s.set_zpw_sek(sek);
+    }
     if let Some(li) = &mut s.login {
         if li.display_name.is_empty() && !name.is_empty() {
             li.display_name = name.clone();
@@ -453,12 +486,36 @@ async fn qr_finish(
     }
     let _ = s.sync_profile_me().await;
     s.sync_live_sek();
+    if let Some(sek) = s.current_zpw_sek() {
+        s.set_zpw_sek(sek);
+    }
     if let Some(li) = &mut s.login {
         if li.display_name.is_empty() && !name.is_empty() {
             li.display_name = name;
         }
         if li.avatar.is_empty() && !ava.is_empty() {
             li.avatar = ava;
+        }
+    }
+    if std::path::Path::new("session.json").exists() {
+        let mut should_backup = false;
+        if let Ok(raw) = std::fs::read_to_string("session.json") {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                let has_sek = v
+                    .get("zpw_sek")
+                    .and_then(Value::as_str)
+                    .map(|x| !x.is_empty() && x != "EXPIRED")
+                    .unwrap_or(false)
+                    || v.get("login")
+                        .and_then(|l| l.get("zpw_sek"))
+                        .and_then(Value::as_str)
+                        .map(|x| !x.is_empty() && x != "EXPIRED")
+                        .unwrap_or(false);
+                should_backup = has_sek;
+            }
+        }
+        if should_backup {
+            let _ = std::fs::copy("session.json", "session.json.bak");
         }
     }
     s.save_to_file("session.json")?;
@@ -634,6 +691,7 @@ pub async fn route(
         ("GET", "/api/v1/threads") => {
             let mut t = chat::load_threads_cache();
             store::load_history_into_threads(db_path, &mut t, 50);
+            sort_threads(&mut t);
             t.truncate(limit(500));
             (200, json!({ "ok": true, "threads": t.iter().map(|x| thread_json(x, 50)).collect::<Vec<_>>() }))
         }
